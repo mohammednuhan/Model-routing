@@ -1,0 +1,23 @@
+cff-version: 1.2.0
+message: "If you use Tamias in academic work, please cite the architecture specification."
+title: "Tamias: Transition-Aware Inference Economics for Coding Agents"
+abstract: >-
+  Tamias is an observation instrument for inference economics. It records
+  per-request token metadata in a canonical SQLite ledger without persisting
+  prompt text, source code, tool arguments or assistant text. Observed cost,
+  estimated exposure and causal effect are kept as separate quantities, and
+  any value that cannot be established from a source is recorded as UNKNOWN
+  rather than guessed.
+type: software
+version: 0.1.0
+license: MIT
+repository-code: "UNPUBLISHED"
+keywords:
+  - inference
+  - economics
+  - coding agents
+  - cost observability
+  - reproducibility
+notes: >-
+  Version 0.1.0 implements the observation path only (scan and the canonical
+  ledger). Reporting, receipts, attribution and causal modules are stubs.

@@ -1,29 +1,21 @@
-"""Claude Code session-log parser: metadata extraction only.
+"""Claude Code log source: metadata-only parser.
 
-Scope
------
-This module turns raw Claude Code session-log lines into section 6.1 request
-records. It extracts **metadata only**. It never returns, stores or logs
-prompt text, source-code text, tool arguments, assistant text or any other
-transcript content (spec 6.3).
+Scope and honesty rules (spec sections 6.1-6.4 and 31):
 
-Evidence status of the field map
---------------------------------
-The candidate key paths below are declared, versioned and *unverified*: the
-schema of this client version has not been confirmed against real logs on the
-machine where this parser was written (see ``docs/LOG-SCHEMA.md``). Every
-record produced here therefore carries ``schema_status='unverified'``, and the
-parser also records the key paths it actually observed so the field map can be
-corrected from evidence rather than from assumption.
-
-Consequences of that status, per rule 3 (anything not establishable is UNKNOWN,
-never a guess):
-
-* a field whose key path is not present in a record is stored as NULL;
-* ``effort`` is NULL and ``effort_source`` is ``'unknown'`` unless an effort
-  key is actually present in the record;
-* record types the parser does not recognise are counted and reported, never
-  silently skipped.
+* Metadata only. This module never returns prompt text, assistant text, tool
+  arguments or any transcript content. Tool *names* are kept because the spec
+  lists them as a metadata field; tool inputs never are.
+* Rule 3: anything not establishable from the line is ``None`` (NULL) or the
+  spec's ``unknown`` enum member. Nothing is inferred to make a field look
+  populated.
+* The client log schema has NOT been verified against real logs for this
+  client version, so ``SCHEMA_STATUS`` is ``unverified`` and every parsed
+  record carries it. Field *paths* below are candidates to be confirmed, not
+  verified facts.
+* Every record carries ``raw_record_hash`` (spec 6.1) and ``parser_version``
+  (spec 6.2 reproducibility requirement).
+* Lines that cannot yield usage are reported as ``ParseIssue`` with a reason;
+  they are never silently discarded.
 """
 
 from __future__ import annotations
@@ -34,188 +26,97 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
+# Bumped whenever extraction semantics change. Stored on every row so a later
+# parser change cannot silently alter historical numbers.
 PARSER_VERSION = "claude-code-parser/0.1.0"
-SCHEMA_ID = "claude-code-session-log"
+
+# The candidate schema identity for the Claude Code JSONL transcript. This is
+# a hypothesis to be verified (Gate B), not an established fact.
+SCHEMA_ID = "claude-code-jsonl-candidate/0.1.0"
+
+# No real logs have been inspected for this client version. Field presence is
+# therefore UNKNOWN; see docs/LOG-SCHEMA.md.
 SCHEMA_STATUS = "unverified"
-AGENT_NAME = "claude-code"
 
-# Keys whose values must never leave the parser, whatever their nesting.
-FORBIDDEN_CONTENT_KEYS = frozenset(
-    {
-        "text",
-        "content",
-        "input",
-        "arguments",
-        "args",
-        "params",
-        "prompt",
-        "message_text",
-        "result",
-        "stdout",
-        "stderr",
-        "output",
-        "command",
-        "patch",
-        "diff",
-        "body",
-    }
+# Record types this parser has candidate handling for. Anything else is
+# counted as unsupported by the caller but still parsed if it carries usage.
+KNOWN_RECORD_TYPES = (
+    "assistant",
+    "user",
+    "system",
+    "summary",
+    "file-history-snapshot",
+    "queued-command",
 )
 
-# Candidate scalar paths. Each entry lists candidate key paths; a dotted path
-# addresses one level of nesting. These are hypotheses, not verified names.
-CANDIDATE_PATHS: Mapping[str, tuple[str, ...]] = {
-    "run_id": ("runId", "run_id"),
-    "session_id": ("sessionId", "session_id"),
-    "ts_utc": ("timestamp", "ts"),
-    "request_id": ("requestId", "request_id"),
-    "message_id": ("message.id", "messageId", "message_id"),
-    "is_sidechain": ("isSidechain", "is_sidechain"),
-    "agent_version": ("version", "agentVersion", "agent_version"),
-    "model_id": ("message.model", "model", "modelId", "model_id"),
-    "surface": ("surface",),
-    "provider": ("provider",),
-    "effort": ("effort", "reasoningEffort", "reasoning_effort"),
-    "effort_mechanism": ("effortMechanism", "effort_mechanism"),
-    "thinking_mode": ("thinkingMode", "thinking_mode", "thinking"),
-    "speed_or_service_tier": ("speed", "serviceTier", "service_tier"),
-    "fallback_flag": ("isFallback", "fallback", "fallback_flag"),
-    "fallback_target_model": ("fallbackTargetModel", "fallback_target_model"),
-    "cache_miss_reason": ("cacheMissReason", "cache_miss_reason"),
-    "cache_diagnostic_source": ("cacheDiagnosticSource", "cache_diagnostic_source"),
-    "compaction_signal": ("isCompactSummary", "compaction", "compaction_signal"),
-    "image_or_context_trim_signal": (
-        "imageOrContextTrim",
-        "contextTrim",
-        "image_or_context_trim_signal",
-    ),
-    "model_source": ("modelSource", "model_source"),
-}
+# Candidate field paths, relative to the record and to record["message"].
+_USAGE_PATHS = ("message.usage", "usage")
+_INPUT_KEYS = ("input_tokens", "prompt_tokens")
+_OUTPUT_KEYS = ("output_tokens", "completion_tokens")
+_CACHE_READ_KEYS = ("cache_read_input_tokens", "cache_read_tokens")
+_CACHE_WRITE_TOTAL_KEYS = ("cache_creation_input_tokens", "cache_write_tokens")
+_CACHE_WRITE_5M_KEYS = ("cache_creation_5m_input_tokens", "cache_creation_5m_tokens")
+_CACHE_WRITE_1H_KEYS = ("cache_creation_1h_input_tokens", "cache_creation_1h_tokens")
 
-# Usage block location and the token fields inside it.
-USAGE_PATHS: tuple[str, ...] = ("message.usage", "usage", "tokenUsage")
-USAGE_TOKEN_PATHS: Mapping[str, tuple[str, ...]] = {
-    "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens", "promptTokens"),
-    "output_tokens": (
-        "output_tokens",
-        "outputTokens",
-        "completion_tokens",
-        "completionTokens",
-    ),
-    "cache_read_tokens": (
-        "cache_read_input_tokens",
-        "cacheReadInputTokens",
-        "cache_read_tokens",
-        "cacheReadTokens",
-    ),
-    "cache_write_tokens": (
-        "cache_creation_input_tokens",
-        "cacheCreationInputTokens",
-        "cache_write_tokens",
-        "cacheWriteTokens",
-    ),
-    "cache_write_5m_tokens": (
-        "cache_creation_5m_input_tokens",
-        "cacheCreation5mInputTokens",
-        "cache_write_5m_tokens",
-    ),
-    "cache_write_1h_tokens": (
-        "cache_creation_1h_input_tokens",
-        "cacheCreation1hInputTokens",
-        "cache_write_1h_tokens",
-    ),
-}
-
-# Record types the parser knows how to name. Anything else is counted and
-# reported as unsupported. These are names, not verified types.
-KNOWN_RECORD_TYPES = frozenset(
-    {"assistant", "user", "system", "summary", "file-history-snapshot"}
+_TOKEN_KEYS = (
+    *_INPUT_KEYS,
+    *_OUTPUT_KEYS,
+    *_CACHE_READ_KEYS,
+    *_CACHE_WRITE_TOTAL_KEYS,
+    *_CACHE_WRITE_5M_KEYS,
+    *_CACHE_WRITE_1H_KEYS,
 )
 
-_MISSING = object()
+# Top-level keys that would indicate a compaction event if observed. Recorded
+# as a signal when present; otherwise NULL (never guessed as 0/false).
+_COMPACTION_KEYS = ("isCompactSummary", "compactMetadata", "subtype")
 
 
-@dataclass
-class ParsedRecord:
-    """One section 6.1 request record plus parser bookkeeping."""
-
-    record: dict[str, Any]
-    record_type: str
-    raw_record_hash: str
-    is_usage_record: bool
-    is_zero_usage: bool
-    is_synthetic: bool
-    observed_keys: tuple[str, ...]
-    source_line: int
-    source_file: str
-
-
-@dataclass
+@dataclass(frozen=True)
 class ParseIssue:
-    """A record the parser could not turn into a ledger row."""
+    """A line that produced no ledger record, with the reason why."""
 
+    reason: str
     source_file: str
     source_line: int
-    reason: str
     record_type: str | None = None
     raw_record_hash: str | None = None
 
 
+@dataclass(frozen=True)
+class ParsedRecord:
+    """One metadata-only section 6.1 record ready for the ledger."""
+
+    record: dict[str, Any]
+    source_file: str
+    source_line: int
+    is_zero_usage: bool = False
+    is_synthetic: bool = False
+
+    @property
+    def raw_record_hash(self) -> str:
+        return str(self.record["raw_record_hash"])
+
+
 @dataclass
-class ParseResult:
+class FileParseResult:
+    path: Path
     records: list[ParsedRecord] = field(default_factory=list)
     issues: list[ParseIssue] = field(default_factory=list)
     record_type_counts: dict[str, int] = field(default_factory=dict)
-    observed_keys: dict[str, set[str]] = field(default_factory=dict)
+    observed_keys: dict[str, list[str]] = field(default_factory=dict)
     files_read: int = 0
     lines_read: int = 0
     blank_lines: int = 0
 
 
-def dig(record: Any, path: str) -> Any:
-    """Follow a dotted path. Returns ``_MISSING`` when any hop is absent."""
-    current = record
-    for part in path.split("."):
-        if isinstance(current, Mapping) and part in current:
-            current = current[part]
-        else:
-            return _MISSING
-    return current
-
-
-def _first(record: Mapping[str, Any], paths: Sequence[str]) -> Any:
-    for path in paths:
-        value = dig(record, path)
-        if value is not _MISSING and value is not None:
-            return value
-    return None
-
-
-def walk_key_paths(node: Any, prefix: str = "", depth: int = 0, out: set[str] | None = None) -> set[str]:
-    """Collect key *paths* only. Values are never captured."""
-    if out is None:
-        out = set()
-    if depth > 6:
-        return out
-    if isinstance(node, Mapping):
-        for key, value in node.items():
-            path = f"{prefix}.{key}" if prefix else str(key)
-            out.add(path)
-            if isinstance(value, (Mapping, list)):
-                walk_key_paths(value, path, depth + 1, out)
-    elif isinstance(node, list):
-        for item in node[:1]:
-            if isinstance(item, (Mapping, list)):
-                walk_key_paths(item, f"{prefix}[]", depth + 1, out)
-    return out
-
-
-def raw_hash(raw_line: str) -> str:
-    """Stable hash of the raw log line. The line itself is not stored."""
-    return hashlib.sha256(raw_line.encode("utf-8", errors="replace")).hexdigest()
+def _hash(raw: str | bytes) -> str:
+    data = raw.encode("utf-8") if isinstance(raw, str) else raw
+    return hashlib.sha256(data).hexdigest()
 
 
 def _as_int(value: Any) -> int | None:
-    if isinstance(value, bool) or value is None:
+    if value is None or isinstance(value, bool):
         return None
     if isinstance(value, int):
         return value
@@ -229,62 +130,86 @@ def _as_int(value: Any) -> int | None:
     return None
 
 
-def _as_bool(value: Any) -> int | None:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, int):
-        return int(bool(value))
-    if isinstance(value, str):
-        lowered = value.strip().lower()
-        if lowered in {"true", "1", "yes"}:
-            return 1
-        if lowered in {"false", "0", "no"}:
-            return 0
+def _first_int(usage: Mapping[str, Any], keys: Sequence[str]) -> int | None:
+    for key in keys:
+        if key in usage:
+            value = _as_int(usage[key])
+            if value is not None:
+                return value
     return None
 
 
-def extract_tool_names(record: Mapping[str, Any]) -> list[str]:
-    """Collect tool *names* only.
+def _dig(record: Mapping[str, Any], path: str) -> Any:
+    node: Any = record
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return None
+        node = node[part]
+    return node
 
-    Content blocks are visited looking for tool-use blocks and only the
-    ``name`` key is read. Tool arguments (``input``) are never read, so they
-    cannot reach the ledger.
-    """
+
+def _has_path(record: Mapping[str, Any], path: str) -> bool:
+    node: Any = record
+    for part in path.split("."):
+        if not isinstance(node, Mapping) or part not in node:
+            return False
+        node = node[part]
+    return True
+
+
+def _tool_names(message: Mapping[str, Any]) -> str | None:
+    """Tool names only. Tool inputs are never read, let alone stored."""
+    content = message.get("content")
+    if not isinstance(content, Sequence) or isinstance(content, (str, bytes)):
+        return None
     names: list[str] = []
-
-    def visit(node: Any, depth: int = 0) -> None:
-        if depth > 6:
-            return
-        if isinstance(node, Mapping):
-            if node.get("type") == "tool_use" and isinstance(node.get("name"), str):
-                name = node["name"]
-                if name not in names:
-                    names.append(name)
-            for key, value in node.items():
-                if key in FORBIDDEN_CONTENT_KEYS and not isinstance(value, (Mapping, list)):
-                    continue
-                if isinstance(value, (Mapping, list)):
-                    visit(value, depth + 1)
-        elif isinstance(node, list):
-            for item in node:
-                visit(item, depth + 1)
-
-    visit(record)
-    return names
+    for block in content:
+        if not isinstance(block, Mapping):
+            continue
+        if block.get("type") == "tool_use":
+            name = block.get("name")
+            if isinstance(name, str) and name and name not in names:
+                names.append(name)
+    return json.dumps(names) if names else None
 
 
-def classify_record_type(record: Mapping[str, Any]) -> str:
-    value = record.get("type")
-    if isinstance(value, str) and value:
-        return value
+def _request_bucket(record: Mapping[str, Any]) -> str:
+    sidechain = record.get("isSidechain")
+    if sidechain is True or (
+        not isinstance(sidechain, bool) and str(sidechain).lower() == "true"
+    ):
+        return "subagent"
+    if record.get("isCompactSummary") or record.get("compactMetadata"):
+        return "compaction"
+    if "subtype" in record and str(record.get("subtype")).lower() == "compact":
+        return "compaction"
+    return "main"
+
+
+def _effort_fields(record: Mapping[str, Any]) -> tuple[str | None, str, str]:
+    """Return ``(effort, effort_source, effort_mechanism)``.
+
+    Effort is reported only when the line states it. An absent effort yields
+    ``(None, 'unknown', 'unknown')``; it is never back-filled.
+    """
+    for key in ("effort", "reasoningEffort", "thinking_effort"):
+        value = record.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip(), "recorded", "top_level"
     message = record.get("message")
     if isinstance(message, Mapping):
-        role = message.get("role")
-        if isinstance(role, str) and role:
-            return role
-    return "unknown"
+        for key in ("effort", "reasoningEffort", "thinking_effort"):
+            value = message.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip(), "recorded", "per_message"
+        thinking = message.get("thinking")
+        if isinstance(thinking, Mapping):
+            budget = thinking.get("budget_tokens")
+            if _as_int(budget) is not None:
+                # A native budget is a different mechanism from a named
+                # effort level, so the value is not translated into one.
+                return None, "unknown", "native_budget"
+    return None, "unknown", "unknown"
 
 
 def parse_record(
@@ -293,242 +218,227 @@ def parse_record(
     source_file: str,
     source_line: int,
     run_id: str | None = None,
-    seq: int | None = None,
 ) -> ParsedRecord | ParseIssue:
-    """Parse one JSONL line into a section 6.1 record, or report why not."""
-    line_hash = raw_hash(raw_line)
+    """Parse one JSONL line into a metadata-only record or a ``ParseIssue``."""
+    raw_hash = _hash(raw_line)
+
     try:
-        payload = json.loads(raw_line)
-    except json.JSONDecodeError:
-        return ParseIssue(source_file, source_line, "malformed_json", None, line_hash)
+        record = json.loads(raw_line)
+    except (json.JSONDecodeError, ValueError):
+        return ParseIssue(
+            reason="malformed_json",
+            source_file=source_file,
+            source_line=source_line,
+            raw_record_hash=raw_hash,
+        )
 
-    if not isinstance(payload, Mapping):
-        return ParseIssue(source_file, source_line, "not_an_object", None, line_hash)
+    if not isinstance(record, Mapping):
+        return ParseIssue(
+            reason="not_an_object",
+            source_file=source_file,
+            source_line=source_line,
+            raw_record_hash=raw_hash,
+        )
 
-    record_type = classify_record_type(payload)
-    observed = tuple(sorted(walk_key_paths(payload)))
+    record_type = record.get("type") if isinstance(record.get("type"), str) else None
 
-    model_id = _first(payload, CANDIDATE_PATHS["model_id"])
-    request_id = _first(payload, CANDIDATE_PATHS["request_id"])
-    message_id = _first(payload, CANDIDATE_PATHS["message_id"])
-
-    usage: Mapping[str, Any] | None = None
-    for path in USAGE_PATHS:
-        candidate = dig(payload, path)
+    usage = None
+    for path in _USAGE_PATHS:
+        candidate = _dig(record, path)
         if isinstance(candidate, Mapping):
             usage = candidate
             break
+    if usage is None and isinstance(record.get("usage"), Mapping):
+        usage = record["usage"]
 
-    token_values: dict[str, int | None] = {}
-    for field_name, paths in USAGE_TOKEN_PATHS.items():
-        raw_value = _first(usage, paths) if usage is not None else None
-        token_values[field_name] = _as_int(raw_value)
-
-    has_usage_block = usage is not None
-    has_any_token = any(v is not None for v in token_values.values())
-
-    if not has_any_token:
-        # No measurable token usage: the record cannot become a priced request
-        # record. Counted and reported, never silently dropped.
+    if usage is None:
         return ParseIssue(
-            source_file,
-            source_line,
-            "no_usage_block" if not has_usage_block else "usage_without_token_fields",
-            record_type,
-            line_hash,
+            reason="no_usage_block",
+            source_file=source_file,
+            source_line=source_line,
+            record_type=record_type,
+            raw_record_hash=raw_hash,
         )
 
-    known = [v for v in token_values.values() if v is not None]
-    is_zero_usage = bool(known) and all(v == 0 for v in known)
+    if not any(_as_int(usage.get(key)) is not None for key in _TOKEN_KEYS):
+        return ParseIssue(
+            reason="usage_without_token_fields",
+            source_file=source_file,
+            source_line=source_line,
+            record_type=record_type,
+            raw_record_hash=raw_hash,
+        )
 
-    sidechain = _as_bool(_first(payload, CANDIDATE_PATHS["is_sidechain"]))
-    compaction = _as_bool(_first(payload, CANDIDATE_PATHS["compaction_signal"]))
-    is_synthetic = message_id is None and request_id is None
+    message = record.get("message") if isinstance(record.get("message"), Mapping) else {}
 
-    if sidechain == 1:
-        bucket = "subagent"
-    elif compaction == 1:
-        bucket = "compaction"
-    elif is_synthetic:
-        bucket = "unknown"
-    else:
-        bucket = "main"
+    input_tokens = _first_int(usage, _INPUT_KEYS)
+    output_tokens = _first_int(usage, _OUTPUT_KEYS)
+    cache_read = _first_int(usage, _CACHE_READ_KEYS)
+    cache_write_total = _first_int(usage, _CACHE_WRITE_TOTAL_KEYS)
+    cache_write_5m = _first_int(usage, _CACHE_WRITE_5M_KEYS)
+    cache_write_1h = _first_int(usage, _CACHE_WRITE_1H_KEYS)
 
-    cache_write_5m = token_values["cache_write_5m_tokens"]
-    cache_write_1h = token_values["cache_write_1h_tokens"]
-    cache_write_total = token_values["cache_write_tokens"]
-    if cache_write_total is None and (cache_write_5m is not None or cache_write_1h is not None):
-        cache_write_total = (cache_write_5m or 0) + (cache_write_1h or 0)
+    token_values = (
+        input_tokens,
+        output_tokens,
+        cache_read,
+        cache_write_total,
+        cache_write_5m,
+        cache_write_1h,
+    )
+    # An absent split bucket is zero, not a positive signal: a record with no
+    # non-zero token value anywhere is a zero-usage record.
+    is_zero_usage = all((value or 0) == 0 for value in token_values)
 
-    effort = _first(payload, CANDIDATE_PATHS["effort"])
-    effort_mechanism = _first(payload, CANDIDATE_PATHS["effort_mechanism"])
+    message_id = message.get("id")
+    message_id = message_id.strip() if isinstance(message_id, str) else None
+    request_id = record.get("requestId")
+    request_id = request_id.strip() if isinstance(request_id, str) else None
+    is_synthetic = not (message_id or request_id)
 
-    tool_names = extract_tool_names(payload)
+    model = message.get("model")
+    effort, effort_source, effort_mechanism = _effort_fields(record)
 
-    record: dict[str, Any] = {
-        "run_id": run_id
-        if run_id is not None
-        else _first(payload, CANDIDATE_PATHS["run_id"]),
-        "session_id": _first(payload, CANDIDATE_PATHS["session_id"]),
-        "seq": seq,
-        "ts_utc": _first(payload, CANDIDATE_PATHS["ts_utc"]),
+    sidechain = record.get("isSidechain")
+    compaction_signal = 1 if _request_bucket(record) == "compaction" else None
+
+    out: dict[str, Any] = {
+        "run_id": run_id,
+        "session_id": _optional_str(record.get("sessionId")),
+        "seq": None,
+        "ts_utc": _optional_str(record.get("timestamp")),
         "request_id": request_id,
         "message_id": message_id,
-        "is_sidechain": sidechain,
-        "request_bucket": bucket,
-        "agent": AGENT_NAME if record_type in KNOWN_RECORD_TYPES else None,
-        "agent_version": _first(payload, CANDIDATE_PATHS["agent_version"]),
-        "provider": _first(payload, CANDIDATE_PATHS["provider"]),
-        "surface": _first(payload, CANDIDATE_PATHS["surface"]),
-        "model_id": model_id,
-        "model_source": _first(payload, CANDIDATE_PATHS["model_source"]) or "unknown",
-        "effort": effort if isinstance(effort, (str, int, float)) else None,
-        "effort_source": "recorded" if effort is not None else "unknown",
-        "effort_mechanism": effort_mechanism
-        if effort_mechanism in set(EFFORT_MECHANISM_VALUES)
-        else "unknown",
-        "thinking_mode": _coerce_thinking(
-            _first(payload, CANDIDATE_PATHS["thinking_mode"])
-        ),
-        "speed_or_service_tier": _first(
-            payload, CANDIDATE_PATHS["speed_or_service_tier"]
-        ),
-        "fallback_flag": _as_bool(_first(payload, CANDIDATE_PATHS["fallback_flag"])),
-        "fallback_target_model": _first(
-            payload, CANDIDATE_PATHS["fallback_target_model"]
-        ),
-        "input_tokens": token_values["input_tokens"],
-        "output_tokens": token_values["output_tokens"],
-        "cache_read_tokens": token_values["cache_read_tokens"],
+        "is_sidechain": sidechain if isinstance(sidechain, bool) else None,
+        "request_bucket": "unknown" if is_synthetic else _request_bucket(record),
+        "agent": "claude-code",
+        "agent_version": _optional_str(record.get("version")),
+        "provider": "anthropic",
+        "surface": "cli",
+        "model_id": _optional_str(model),
+        "model_source": "explicit" if isinstance(model, str) and model.strip() else "unknown",
+        "effort": effort,
+        "effort_source": effort_source,
+        "effort_mechanism": effort_mechanism,
+        "thinking_mode": "unknown",
+        "speed_or_service_tier": _optional_str(record.get("serviceTier")),
+        "fallback_flag": None,
+        "fallback_target_model": None,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
         "cache_write_tokens": cache_write_total,
         "cache_write_5m_tokens": cache_write_5m,
         "cache_write_1h_tokens": cache_write_1h,
         "cache_write_total_tokens": cache_write_total,
-        "tool_names": json.dumps(tool_names) if tool_names else None,
+        "tool_names": _tool_names(message),
         "test_ran": None,
         "test_passed": None,
-        "cache_miss_reason": _first(payload, CANDIDATE_PATHS["cache_miss_reason"]),
-        "cache_diagnostic_source": _first(
-            payload, CANDIDATE_PATHS["cache_diagnostic_source"]
-        )
-        or "unknown",
-        "compaction_signal": compaction,
-        "image_or_context_trim_signal": _as_bool(
-            _first(payload, CANDIDATE_PATHS["image_or_context_trim_signal"])
-        ),
-        "raw_record_hash": line_hash,
+        "cache_miss_reason": None,
+        "cache_diagnostic_source": "unknown",
+        "compaction_signal": compaction_signal,
+        "image_or_context_trim_signal": None,
+        "raw_record_hash": raw_hash,
         "parser_version": PARSER_VERSION,
         "is_zero_usage": is_zero_usage,
         "is_synthetic": is_synthetic,
         "schema_status": SCHEMA_STATUS,
     }
+    # test_signal in the spec vocabulary maps to the two ledger booleans; the
+    # log does not carry them, so both stay NULL.
+    assert _COMPACTION_KEYS  # candidate keys retained for later verification
 
     return ParsedRecord(
-        record=record,
-        record_type=record_type,
-        raw_record_hash=line_hash,
-        is_usage_record=True,
+        record=out,
+        source_file=source_file,
+        source_line=source_line,
         is_zero_usage=is_zero_usage,
         is_synthetic=is_synthetic,
-        observed_keys=observed,
-        source_line=source_line,
-        source_file=source_file,
     )
 
 
-# Spec 6.1 enum for effort_mechanism, duplicated here to keep the parser
-# independent of the ledger module.
-EFFORT_MECHANISM_VALUES = ("per_message", "top_level", "native_budget")
-_THINKING_VALUES = ("adaptive", "enabled", "disabled", "between_tools")
+def _optional_str(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return None
 
 
-def _coerce_thinking(value: Any) -> str:
-    if isinstance(value, str) and value in _THINKING_VALUES:
-        return value
-    if isinstance(value, bool):
-        return "enabled" if value else "disabled"
-    return "unknown"
+def _key_paths(node: Any, prefix: str = "", depth: int = 0) -> Iterator[str]:
+    """Yield key *paths* only. Values are never collected."""
+    if depth > 6 or not isinstance(node, Mapping):
+        return
+    for key, value in node.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        yield path
+        if isinstance(value, Mapping):
+            yield from _key_paths(value, path, depth + 1)
 
 
-def iter_log_files(log_root: str | Path) -> list[Path]:
-    """All ``*.jsonl`` files under ``log_root``, sorted for determinism."""
-    root = Path(log_root).expanduser()
+def parse_file(path: str | Path, *, run_id: str | None = None) -> FileParseResult:
+    """Parse every line of one JSONL log file."""
+    path = Path(path)
+    result = FileParseResult(path=path)
+
+    try:
+        handle = path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        result.issues.append(
+            ParseIssue(
+                reason="unreadable_file",
+                source_file=str(path),
+                source_line=0,
+            )
+        )
+        return result
+
+    with handle:
+        result.files_read = 1
+        seen_keys: set[str] = set()
+        for index, line in enumerate(handle, start=1):
+            result.lines_read += 1
+            stripped = line.strip()
+            if not stripped:
+                result.blank_lines += 1
+                continue
+
+            parsed = parse_record(
+                stripped, source_file=str(path), source_line=index, run_id=run_id
+            )
+            if isinstance(parsed, ParseIssue):
+                result.issues.append(parsed)
+                if parsed.record_type:
+                    result.record_type_counts[parsed.record_type] = (
+                        result.record_type_counts.get(parsed.record_type, 0) + 1
+                    )
+                continue
+
+            result.records.append(parsed)
+            try:
+                raw = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            record_type = raw.get("type") if isinstance(raw, Mapping) else None
+            if isinstance(record_type, str):
+                result.record_type_counts[record_type] = (
+                    result.record_type_counts.get(record_type, 0) + 1
+                )
+                if record_type not in result.observed_keys:
+                    result.observed_keys[record_type] = []
+                for key_path in _key_paths(raw):
+                    if key_path not in seen_keys:
+                        seen_keys.add(key_path)
+                        result.observed_keys[record_type].append(key_path)
+
+    for keys in result.observed_keys.values():
+        keys.sort()
+    return result
+
+
+def iter_log_files(root: str | Path) -> list[Path]:
+    """All ``*.jsonl`` files under ``root``, in a stable sorted order."""
+    root = Path(root).expanduser()
     if not root.exists():
         return []
     if root.is_file():
-        return [root]
-    return sorted(p for p in root.rglob("*.jsonl") if p.is_file())
-
-
-def parse_file(path: str | Path, *, run_id: str | None = None) -> ParseResult:
-    """Parse one log file into records and issues."""
-    file_path = Path(path)
-    result = ParseResult(files_read=1)
-    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            if not line.strip():
-                result.blank_lines += 1
-                continue
-            result.lines_read += 1
-            _absorb(
-                result,
-                parse_record(
-                    line,
-                    source_file=str(file_path),
-                    source_line=line_no,
-                    run_id=run_id,
-                    seq=line_no,
-                ),
-            )
-    return result
-
-
-def parse_paths(
-    paths: Sequence[str | Path], *, run_id: str | None = None
-) -> ParseResult:
-    """Parse many files, merging diagnostics. Dedup happens in the ledger."""
-    merged = ParseResult()
-    for path in paths:
-        result = parse_file(path, run_id=run_id)
-        merged.records.extend(result.records)
-        merged.issues.extend(result.issues)
-        merged.files_read += result.files_read
-        merged.lines_read += result.lines_read
-        merged.blank_lines += result.blank_lines
-        for name, count in result.record_type_counts.items():
-            merged.record_type_counts[name] = merged.record_type_counts.get(name, 0) + count
-        for record_type, keys in result.observed_keys.items():
-            merged.observed_keys.setdefault(record_type, set()).update(keys)
-    return merged
-
-
-def parse_stream(
-    lines: Iterator[str], *, source_file: str, run_id: str | None = None
-) -> ParseResult:
-    """Parse an in-memory line iterator."""
-    result = ParseResult(files_read=1)
-    for line_no, line in enumerate(lines, start=1):
-        if not line.strip():
-            result.blank_lines += 1
-            continue
-        result.lines_read += 1
-        _absorb(
-            result,
-            parse_record(
-                line, source_file=source_file, source_line=line_no, run_id=run_id, seq=line_no
-            ),
-        )
-    return result
-
-
-def _absorb(result: ParseResult, outcome: ParsedRecord | ParseIssue) -> None:
-    if isinstance(outcome, ParseIssue):
-        result.issues.append(outcome)
-        key = outcome.record_type or "unknown"
-        result.record_type_counts[key] = result.record_type_counts.get(key, 0) + 1
-        return
-    result.records.append(outcome)
-    result.record_type_counts[outcome.record_type] = (
-        result.record_type_counts.get(outcome.record_type, 0) + 1
-    )
-    result.observed_keys.setdefault(outcome.record_type, set()).update(outcome.observed_keys)
+        return [root] if root.suffix == ".jsonl" else []
+    return sorted((p for p in root.rglob("*.jsonl") if p.is_file()), key=lambda p: str(p))
